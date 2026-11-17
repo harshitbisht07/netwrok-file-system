@@ -1,0 +1,10 @@
+# build output
+/server
+/client
+/naming-server
+
+# runtime data
+/storage/
+nm_log.txt
+ss_log.txt
+nfs_secret*
