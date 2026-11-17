@@ -1,12 +1,9 @@
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <unistd.h>
-#include <arpa/inet.h>
-#include <sys/socket.h>
-#include <netinet/in.h>
-#include <netdb.h>
-#include <errno.h>
+#ifndef HELPER_H
+#define HELPER_H
+
+#include "nfs_compat.h"
 #include <pthread.h>
 
 extern int writers;
+
+#endif /* HELPER_H */

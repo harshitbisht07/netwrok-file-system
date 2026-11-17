@@ -23,14 +23,9 @@
  */
 
 #define _GNU_SOURCE
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <unistd.h>
-#include <arpa/inet.h>
+#include "nfs_compat.h"
 #include <pthread.h>
 #include <signal.h>
-#include <time.h>
 #include "trie.h"
 #include "convenience.h"
 #include "netproto.h"
@@ -41,6 +36,7 @@
 static char bind_ip[INET_ADDRSTRLEN] = "0.0.0.0";
 static int  nm_port_ss     = DEFAULT_NM_PORT_SS;      /* 5566 */
 static int  nm_port_client = DEFAULT_NM_PORT_CLIENT;  /* 5568 */
+static int  g_remote_rw_only = 0;   /* --remote-rw : other PCs get read/write only */
 static const char *g_secret;
 
 /* ================================================================== */
@@ -71,7 +67,7 @@ static void nm_log(const char *fmt, ...)
     FILE *f = fopen("nm_log.txt", "a");
     if (f)
     {
-        char ts[32]; time_t t = time(NULL); struct tm tmv; localtime_r(&t, &tmv);
+        char ts[32]; time_t t = time(NULL); struct tm tmv; nfs_localtime(&t, &tmv);
         strftime(ts, sizeof ts, "%Y-%m-%d %H:%M:%S", &tmv);
         fprintf(f, "%s ", ts);
         va_list ap; va_start(ap, fmt); vfprintf(f, fmt, ap); va_end(ap);
@@ -132,14 +128,14 @@ static void lru_forget(const char *name)
 /* ================================================================== */
 static int ss_connect(const char *ip, int port)
 {
-    int s = socket(AF_INET, SOCK_STREAM, 0);
+    int s = (int)socket(AF_INET, SOCK_STREAM, 0);
     if (s < 0) return -1;
     struct sockaddr_in a; memset(&a, 0, sizeof a);
     a.sin_family = AF_INET; a.sin_port = htons(port);
-    if (inet_pton(AF_INET, ip, &a.sin_addr) != 1) { close(s); return -1; }
+    if (inet_pton(AF_INET, ip, &a.sin_addr) != 1) { nfs_sockclose(s); return -1; }
     nfs_tune(s); nfs_set_timeout(s, 10);
     if (connect(s, (struct sockaddr *)&a, sizeof a) < 0 || nfs_auth_connect(s, g_secret) != 0)
-        { close(s); return -1; }
+        { nfs_sockclose(s); return -1; }
     return s;
 }
 
@@ -154,7 +150,7 @@ static int ss_call(const char *ip, int port, int op, const char *a1, const char 
     if (!bad && a1) bad = send_str(s, a1);
     if (!bad && a2) bad = send_str(s, a2);
     if (!bad) bad = recv_str(s, resp, cap);
-    close(s);
+    nfs_sockclose(s);
     return bad ? -1 : 0;
 }
 
@@ -165,8 +161,8 @@ static char *fetch_listing(const char *ip, int port)
     if (s < 0) return NULL;
     char *buf = malloc((size_t)NFS_CTRL_MAX + 1);
     uint32_t n = 0;
-    if (!buf || send_str(s, "7") || recv_frame(s, buf, NFS_CTRL_MAX, &n)) { free(buf); close(s); return NULL; }
-    close(s);
+    if (!buf || send_str(s, "7") || recv_frame(s, buf, NFS_CTRL_MAX, &n)) { free(buf); nfs_sockclose(s); return NULL; }
+    nfs_sockclose(s);
     buf[n] = '\0';
     return buf;
 }
@@ -285,12 +281,12 @@ static void *ss_register_thread(void *varg)
     {
         printf("[NM] Rejected storage-server connection from %s (authentication failed)\n", ip);
         nm_log("AUTH rejected SS connection from %s", ip);
-        close(sock); return NULL;
+        nfs_sockclose(sock); return NULL;
     }
     char portbuf[16];
-    if (recv_str(sock, portbuf, sizeof portbuf)) { close(sock); return NULL; }
+    if (recv_str(sock, portbuf, sizeof portbuf)) { nfs_sockclose(sock); return NULL; }
     int port = atoi(portbuf);
-    if (port <= 0 || port > 65535) { send_str(sock, "400: bad port"); close(sock); return NULL; }
+    if (port <= 0 || port > 65535) { send_str(sock, "400: bad port"); nfs_sockclose(sock); return NULL; }
 
     pthread_mutex_lock(&nfs_mutex);
     int slot = -1;
@@ -304,7 +300,7 @@ static void *ss_register_thread(void *varg)
         pthread_mutex_unlock(&nfs_mutex);
         send_str(sock, "503: registry full");
         printf("[NM] SS registry full — rejecting %s:%d\n", ip, port);
-        close(sock); return NULL;
+        nfs_sockclose(sock); return NULL;
     }
     snprintf(ss_registry[slot].ip, sizeof ss_registry[slot].ip, "%s", ip);
     ss_registry[slot].client_port = port;
@@ -316,7 +312,7 @@ static void *ss_register_thread(void *varg)
     pthread_mutex_unlock(&nfs_mutex);
 
     send_str(sock, "OK");
-    close(sock);
+    nfs_sockclose(sock);
 
     /* Pull the file list over the network (NOT from the NM's own disk). */
     char *listing = fetch_listing(ip, port);
@@ -471,7 +467,7 @@ static void handle_list(int sock)
     for (int i = 0; i < n; i++)
     {
         char *l = fetch_listing(snap[i].ip, snap[i].client_port);
-        char head[320];
+        char head[400];
         if (n > 1) snprintf(head, sizeof head, "== %s:%d ==\n", snap[i].ip, snap[i].client_port); else head[0] = '\0';
         if (!l)
         {
@@ -500,16 +496,36 @@ static void *client_thread(void *varg)
     {
         printf("[NM] Rejected client %s (authentication failed)\n", ip);
         nm_log("AUTH rejected client %s", ip);
-        close(sock); return NULL;
+        nfs_sockclose(sock); return NULL;
     }
     nfs_set_timeout(sock, 0);                     /* sessions may sit idle at the menu */
-    printf("[NM] Client connected from %s\n", ip);
+
+    /* Access policy: with --remote-rw, a client on another PC may read, write,
+     * get info, create and list, but not delete or copy.  A client running on
+     * this PC always has full access (it arrives either from 127.0.0.1 or from
+     * one of this machine's own addresses). */
+    int remote = !nfs_is_local_ip(ip);
+    int limited = g_remote_rw_only && remote;
+    printf("[NM] Client connected from %s  (%s, %s access)\n", ip,
+           remote ? "remote" : "this PC", limited ? "read/write" : "full");
+    nm_log("CLIENT connect %s %s %s-access", ip, remote ? "remote" : "local",
+           limited ? "rw" : "full");
 
     char op[16], n1[NFS_MAX_NAME + 8], n2[NFS_MAX_NAME + 8];
     for (;;)
     {
         if (recv_str(sock, op, sizeof op)) break;
         int c = atoi(op);
+
+        if (limited && (c == 5 || c == 6))        /* delete / copy */
+        {
+            if (recv_str(sock, n1, sizeof n1)) break;
+            if (c == 6 && recv_str(sock, n2, sizeof n2)) break;
+            send_str(sock, "403: Read/write access only from this PC (delete and copy are not allowed)");
+            nm_log("DENIED op=%d from %s (read/write access only)", c, ip);
+            continue;
+        }
+
         if (c >= 1 && c <= 5)
         {
             if (recv_str(sock, n1, sizeof n1)) break;
@@ -525,7 +541,7 @@ static void *client_thread(void *varg)
         else if (c == 7) handle_list(sock);
         else send_str(sock, "400: Unknown command");
     }
-    close(sock);
+    nfs_sockclose(sock);
     printf("[NM] Client %s disconnected\n", ip);
     return NULL;
 }
@@ -535,16 +551,16 @@ static void *client_thread(void *varg)
 /* ================================================================== */
 static int make_listening_socket(int port, const char *ip)
 {
-    int s = socket(AF_INET, SOCK_STREAM, 0);
-    if (s < 0) { perror("[NM] socket"); exit(1); }
-    int opt = 1;
-    setsockopt(s, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof opt);
+    int s = (int)socket(AF_INET, SOCK_STREAM, 0);
+    if (s < 0) { fprintf(stderr, "[NM] socket: %s\n", nfs_sockerrstr()); exit(1); }
+    nfs_reuseaddr(s);
     struct sockaddr_in addr; memset(&addr, 0, sizeof addr);
     addr.sin_family = AF_INET; addr.sin_port = htons(port);
     if (strcmp(ip, "0.0.0.0") == 0) addr.sin_addr.s_addr = INADDR_ANY;
     else if (inet_pton(AF_INET, ip, &addr.sin_addr) != 1) { fprintf(stderr, "[NM] Bad bind IP: %s\n", ip); exit(1); }
-    if (bind(s, (struct sockaddr *)&addr, sizeof addr) < 0) { perror("[NM] bind"); exit(1); }
-    if (listen(s, 32) < 0) { perror("[NM] listen"); exit(1); }
+    if (bind(s, (struct sockaddr *)&addr, sizeof addr) < 0)
+        { fprintf(stderr, "[NM] bind port %d: %s\n", port, nfs_sockerrstr()); exit(1); }
+    if (listen(s, 32) < 0) { fprintf(stderr, "[NM] listen: %s\n", nfs_sockerrstr()); exit(1); }
     return s;
 }
 
@@ -557,15 +573,15 @@ static void *listener(void *varg)
     printf("[NM] %-28s: %d\n", cfg->label, cfg->port);
     for (;;)
     {
-        struct sockaddr_in ca; socklen_t len = sizeof ca;
-        int cs = accept(ls, (struct sockaddr *)&ca, &len);
-        if (cs < 0) { if (errno != EINTR) perror("[NM] accept"); continue; }
+        struct sockaddr_in ca; nfs_socklen_t len = sizeof ca;
+        int cs = (int)accept(ls, (struct sockaddr *)&ca, &len);
+        if (cs < 0) { if (!nfs_sock_eintr()) fprintf(stderr, "[NM] accept: %s\n", nfs_sockerrstr()); continue; }
         PeerArg *a = malloc(sizeof *a);
-        if (!a) { close(cs); continue; }
+        if (!a) { nfs_sockclose(cs); continue; }
         a->sock = cs;
         inet_ntop(AF_INET, &ca.sin_addr, a->ip, sizeof a->ip);
         pthread_t t;
-        if (pthread_create(&t, NULL, cfg->fn, a) != 0) { free(a); close(cs); }
+        if (pthread_create(&t, NULL, cfg->fn, a) != 0) { free(a); nfs_sockclose(cs); }
         else pthread_detach(t);
     }
     return NULL;
@@ -573,7 +589,10 @@ static void *listener(void *varg)
 
 int main(int argc, char *argv[])
 {
+    nfs_net_init();
+#ifdef SIGPIPE
     signal(SIGPIPE, SIG_IGN);
+#endif
     g_secret = nfs_load_secret(0);
     if (!g_secret) return 1;
 
@@ -581,9 +600,38 @@ int main(int argc, char *argv[])
     memset(circularArray, 0, sizeof circularArray);
     root = createNode();
 
-    if (argc >= 2) snprintf(bind_ip, sizeof bind_ip, "%s", argv[1]);
-    if (argc >= 3) nm_port_ss     = atoi(argv[2]);
-    if (argc >= 4) nm_port_client = atoi(argv[3]);
+    /* Positional args (bind ip, ss port, client port) with --flags anywhere. */
+    int pos = 0;
+    for (int i = 1; i < argc; i++)
+    {
+        if (strcmp(argv[i], "--remote-rw") == 0)   { g_remote_rw_only = 1; continue; }
+        if (strcmp(argv[i], "--full-access") == 0) { g_remote_rw_only = 0; continue; }
+        if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0)
+        {
+            printf("Usage: naming-server [bind_ip [ss_port [client_port]]] [--remote-rw]\n"
+                   "  --remote-rw   clients on OTHER PCs may read, write, get info, create\n"
+                   "                and list, but not delete or copy.  A client on this PC\n"
+                   "                always keeps full access.\n"
+                   "  NFS_SECRET must be set (shared secret, min %d characters).\n", NFS_MIN_SECRET);
+            return 0;
+        }
+        switch (++pos)
+        {
+            case 1: snprintf(bind_ip, sizeof bind_ip, "%s", argv[i]); break;
+            case 2: nm_port_ss     = atoi(argv[i]); break;
+            case 3: nm_port_client = atoi(argv[i]); break;
+            default: fprintf(stderr, "[NM] Ignoring extra argument: %s\n", argv[i]); break;
+        }
+    }
+    if (!g_remote_rw_only)
+    {
+        const char *e = getenv("NFS_REMOTE_RW_ONLY");
+        if (e && (*e == '1' || *e == 'y' || *e == 'Y' || *e == 't' || *e == 'T')) g_remote_rw_only = 1;
+    }
+    if (nm_port_ss <= 0 || nm_port_ss > 65535 || nm_port_client <= 0 || nm_port_client > 65535)
+        { fprintf(stderr, "[NM] Invalid port\n"); return 1; }
+    if (nm_port_ss == nm_port_client)
+        { fprintf(stderr, "[NM] The SS port and the client port must differ\n"); return 1; }
 
     printf("╔══════════════════════════════════╗\n");
     printf("║       Naming Server (NM)         ║\n");
@@ -592,6 +640,8 @@ int main(int argc, char *argv[])
     printf("║ SS port     : %d\n", nm_port_ss);
     printf("║ Client port : %d\n", nm_port_client);
     printf("║ Auth        : shared secret required\n");
+    printf("║ Other PCs   : %s\n", g_remote_rw_only
+           ? "read / write only (no delete, no copy)" : "full access");
     printf("╚══════════════════════════════════╝\n\n");
 
     static ListenCfg ss_cfg, cl_cfg;

@@ -100,7 +100,7 @@ launch_in_terminal() {
 }
 
 echo -e "${GREEN}[1/3] Launching Naming Server...${NC}"
-launch_in_terminal "NFS - Naming Server" "NFS_SECRET='$NFS_SECRET' ./naming-server 0.0.0.0"
+launch_in_terminal "NFS - Naming Server" "NFS_SECRET='$NFS_SECRET' ./naming-server 0.0.0.0 5566 5568 --remote-rw"
 sleep 2
 
 echo -e "${GREEN}[2/3] Launching Storage Server...${NC}"

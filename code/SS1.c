@@ -25,21 +25,11 @@
  */
 
 #define _GNU_SOURCE
-#include <sys/stat.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <unistd.h>
-#include <arpa/inet.h>
-#include <sys/socket.h>
-#include <netinet/in.h>
-#include <errno.h>
+#include "nfs_compat.h"
+#include "netproto.h"
 #include <pthread.h>
 #include <dirent.h>
 #include <signal.h>
-#include <limits.h>
-#include <time.h>
-#include "netproto.h"
 
 static char        g_root[PATH_MAX];          /* realpath of the storage dir */
 static char        g_nm_ip[INET_ADDRSTRLEN];
@@ -56,7 +46,7 @@ static void log_event(const char *peer, const char *op, const char *detail)
     if (f)
     {
         char ts[32]; time_t t = time(NULL); struct tm tmv;
-        localtime_r(&t, &tmv);
+        nfs_localtime(&t, &tmv);
         strftime(ts, sizeof ts, "%Y-%m-%d %H:%M:%S", &tmv);
         fprintf(f, "%s %-15s %-6s %s\n", ts, peer, op, detail);
         fclose(f);
@@ -84,7 +74,7 @@ static int resolve_path(const char *name, char *out, size_t outsz, int *isdir)
     *slash = '\0';                                  /* full = parent directory */
 
     char rp[PATH_MAX];
-    if (!realpath(full, rp)) return -1;             /* parent must exist */
+    if (!nfs_realpath(full, rp)) return -1;             /* parent must exist */
     size_t rl = strlen(g_root);
     if (strncmp(rp, g_root, rl) != 0 || (rp[rl] != '\0' && rp[rl] != '/')) return -1;
 
@@ -119,7 +109,7 @@ static void op_read(int sock, const char *peer)
         send_str(sock, errno == ENOENT ? "106: File not found" : "101: Error opening file for reading");
         return;
     }
-    int fd = open(path, O_RDONLY | O_NOFOLLOW);
+    int fd = open(path, O_RDONLY | O_NOFOLLOW | NFS_O_BIN);
     if (fd < 0) { send_str(sock, "101: Error opening file for reading"); return; }
 
     if (send_str(sock, "OK") == 0)
@@ -127,7 +117,7 @@ static void op_read(int sock, const char *peer)
         char buf[NFS_CHUNK];
         for (;;)
         {
-            ssize_t n = read(fd, buf, sizeof buf);
+            int n = fd_read_some(fd, buf, sizeof buf);
             if (n < 0 && errno == EINTR) continue;
             if (n <= 0) break;
             if (send_frame(sock, buf, (uint32_t)n)) { close(fd); return; }
@@ -149,7 +139,7 @@ static void op_write(int sock, const char *peer)
     if (resolve_path(name, path, sizeof path, &isdir) != 0 || isdir) err = "108: Invalid file name or path";
     else
     {
-        fd = open(path, O_WRONLY | O_APPEND | O_CREAT | O_NOFOLLOW, 0644);
+        fd = open(path, O_WRONLY | O_APPEND | O_CREAT | O_NOFOLLOW | NFS_O_BIN, 0644);
         if (fd < 0) err = "101: Error opening file for writing";
     }
 
@@ -182,7 +172,7 @@ static void op_info(int sock, const char *peer)
 
     struct stat st;
     if (stat(path, &st) != 0) { send_str(sock, errno == ENOENT ? "106: File not found" : "105: Error getting file information"); return; }
-    char ts[32]; struct tm tmv; localtime_r(&st.st_mtime, &tmv);
+    char ts[32]; struct tm tmv; nfs_localtime(&st.st_mtime, &tmv);
     strftime(ts, sizeof ts, "%Y-%m-%d %H:%M:%S", &tmv);
     char info[2048];
     snprintf(info, sizeof info, "Name: %s | Type: %s | Size: %lld bytes | Permissions: %o | Modified: %s",
@@ -200,11 +190,11 @@ static void op_create(int sock, const char *peer)
 
     if (isdir)
     {
-        if (mkdir(path, 0755) == 0) { send_str(sock, "[ACK] Directory created successfully!"); log_event(peer, "MKDIR", name); }
+        if (nfs_mkdir(path) == 0) { send_str(sock, "[ACK] Directory created successfully!"); log_event(peer, "MKDIR", name); }
         else send_str(sock, errno == EEXIST ? "104: File already exists!" : "102: Error creating directory!");
         return;
     }
-    int fd = open(path, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, 0644);
+    int fd = open(path, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | NFS_O_BIN, 0644);
     if (fd >= 0) { close(fd); send_str(sock, "[ACK] File creation successful!"); log_event(peer, "CREATE", name); }
     else send_str(sock, errno == EEXIST ? "104: File already exists!" : "102: Error creating file!");
 }
@@ -215,7 +205,7 @@ static void op_delete(int sock, const char *peer)
     if (get_name(sock, name, sizeof name)) return;
     if (resolve_or_reply(sock, name, path, sizeof path, &isdir)) return;
 
-    if (remove(path) == 0) { send_str(sock, "[ACK] File deletion successful!"); log_event(peer, "DELETE", name); }
+    if (nfs_remove_path(path) == 0) { send_str(sock, "[ACK] File deletion successful!"); log_event(peer, "DELETE", name); }
     else send_str(sock, errno == ENOENT ? "106: File not found" : "103: Error deleting file!");
 }
 
@@ -231,11 +221,11 @@ static void op_copy(int sock, const char *peer)
 
     struct stat st;
     if (stat(psrc, &st) != 0 || !S_ISREG(st.st_mode)) { send_str(sock, "106: Source file not found"); return; }
-    int in = open(psrc, O_RDONLY | O_NOFOLLOW);
+    int in = open(psrc, O_RDONLY | O_NOFOLLOW | NFS_O_BIN);
     if (in < 0) { send_str(sock, "101: Error opening source file!"); return; }
     /* O_EXCL: never overwrite (the old code opened dst with "w", so copying a
      * file onto itself truncated it to zero bytes). */
-    int out = open(pdst, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, 0644);
+    int out = open(pdst, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | NFS_O_BIN, 0644);
     if (out < 0)
     {
         close(in);
@@ -245,14 +235,14 @@ static void op_copy(int sock, const char *peer)
     char buf[NFS_CHUNK]; int bad = 0;
     for (;;)
     {
-        ssize_t n = read(in, buf, sizeof buf);
+        int n = fd_read_some(in, buf, sizeof buf);
         if (n < 0 && errno == EINTR) continue;
         if (n < 0) { bad = 1; break; }
         if (n == 0) break;
         if (fd_write_all(out, buf, (size_t)n)) { bad = 1; break; }
     }
     close(in); close(out);
-    if (bad) { unlink(pdst); send_str(sock, "102: Error copying file!"); return; }
+    if (bad) { remove(pdst); send_str(sock, "102: Error copying file!"); return; }
     send_str(sock, "[ACK] File copy successful!");
     char d[2 * (NFS_MAX_NAME + 8) + 8]; snprintf(d, sizeof d, "%s -> %s", src, dst);
     log_event(peer, "COPY", d);
@@ -352,7 +342,7 @@ static void *handle_client(void *varg)
         default: send_str(sock, "400: Unknown command");
     }
 done:
-    close(sock);
+    nfs_sockclose(sock);
     return NULL;
 }
 
@@ -364,18 +354,18 @@ done:
 /* ------------------------------------------------------------------ */
 static int register_with_nm(void)
 {
-    int s = socket(AF_INET, SOCK_STREAM, 0);
+    int s = (int)socket(AF_INET, SOCK_STREAM, 0);
     if (s < 0) return -1;
     struct sockaddr_in a; memset(&a, 0, sizeof a);
     a.sin_family = AF_INET; a.sin_port = htons(g_nm_port);
-    if (inet_pton(AF_INET, g_nm_ip, &a.sin_addr) != 1) { close(s); return -2; }
+    if (inet_pton(AF_INET, g_nm_ip, &a.sin_addr) != 1) { nfs_sockclose(s); return -2; }
     nfs_tune(s); nfs_set_timeout(s, 10);
-    if (connect(s, (struct sockaddr *)&a, sizeof a) < 0) { close(s); return -1; }
-    if (nfs_auth_connect(s, g_secret) != 0) { close(s); return -3; }
+    if (connect(s, (struct sockaddr *)&a, sizeof a) < 0) { nfs_sockclose(s); return -1; }
+    if (nfs_auth_connect(s, g_secret) != 0) { nfs_sockclose(s); return -3; }
     char port[16], resp[128];
     snprintf(port, sizeof port, "%d", g_client_port);
-    if (send_str(s, port) || recv_str(s, resp, sizeof resp)) { close(s); return -1; }
-    close(s);
+    if (send_str(s, port) || recv_str(s, resp, sizeof resp)) { nfs_sockclose(s); return -1; }
+    nfs_sockclose(s);
     if (strcmp(resp, "OK") != 0) { fprintf(stderr, "[SS] NM refused registration: %s\n", resp); return -4; }
     return 0;
 }
@@ -395,7 +385,7 @@ static void *nm_reg_thread(void *arg)
         else if (r == -2) { fprintf(stderr, "[SS] Bad NM address: %s\n", g_nm_ip); return NULL; }
         else if (attempt == 1 || attempt % 10 == 0)
             fprintf(stderr, "[SS] Naming Server %s:%d not reachable yet — retrying...\n", g_nm_ip, g_nm_port);
-        sleep(3);
+        nfs_sleep(3);
     }
 }
 
@@ -409,7 +399,10 @@ int main(int argc, char *argv[])
                         "Example: NFS_SECRET=... ./server 192.168.1.10 5566 5567 ./storage\n");
         return 1;
     }
+    nfs_net_init();
+#ifdef SIGPIPE
     signal(SIGPIPE, SIG_IGN);
+#endif
 
     g_secret = nfs_load_secret(0);
     if (!g_secret) return 1;
@@ -421,8 +414,8 @@ int main(int argc, char *argv[])
         { fprintf(stderr, "[SS] Invalid port\n"); return 1; }
 
     const char *dir = (argc >= 5) ? argv[4] : "storage";
-    if (mkdir(dir, 0755) != 0 && errno != EEXIST) { perror("[SS] mkdir storage dir"); return 1; }
-    if (!realpath(dir, g_root)) { perror("[SS] storage dir"); return 1; }
+    if (nfs_mkdir(dir) != 0 && errno != EEXIST) { perror("[SS] mkdir storage dir"); return 1; }
+    if (!nfs_realpath(dir, g_root)) { perror("[SS] storage dir"); return 1; }
     struct stat st;
     if (stat(g_root, &st) != 0 || !S_ISDIR(st.st_mode)) { fprintf(stderr, "[SS] %s is not a directory\n", g_root); return 1; }
 
@@ -434,14 +427,14 @@ int main(int argc, char *argv[])
     printf("║ Storage dir : %s\n", g_root);
     printf("╚══════════════════════════════════╝\n\n");
 
-    int server_sock = socket(AF_INET, SOCK_STREAM, 0);
-    if (server_sock < 0) { perror("[SS] socket"); return 1; }
-    int opt = 1;
-    setsockopt(server_sock, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof opt);
+    int server_sock = (int)socket(AF_INET, SOCK_STREAM, 0);
+    if (server_sock < 0) { fprintf(stderr, "[SS] socket: %s\n", nfs_sockerrstr()); return 1; }
+    nfs_reuseaddr(server_sock);
     struct sockaddr_in addr; memset(&addr, 0, sizeof addr);
     addr.sin_family = AF_INET; addr.sin_port = htons(g_client_port); addr.sin_addr.s_addr = INADDR_ANY;
-    if (bind(server_sock, (struct sockaddr *)&addr, sizeof addr) < 0) { perror("[SS] bind"); return 1; }
-    if (listen(server_sock, 32) < 0) { perror("[SS] listen"); return 1; }
+    if (bind(server_sock, (struct sockaddr *)&addr, sizeof addr) < 0)
+        { fprintf(stderr, "[SS] bind port %d: %s\n", g_client_port, nfs_sockerrstr()); return 1; }
+    if (listen(server_sock, 32) < 0) { fprintf(stderr, "[SS] listen: %s\n", nfs_sockerrstr()); return 1; }
     printf("[SS] Listening on port %d (authentication required)\n", g_client_port);
 
     /* Only register once we are really listening: NM connects back for LIST. */
@@ -451,15 +444,15 @@ int main(int argc, char *argv[])
 
     for (;;)
     {
-        struct sockaddr_in ca; socklen_t len = sizeof ca;
-        int cs = accept(server_sock, (struct sockaddr *)&ca, &len);
-        if (cs < 0) { if (errno != EINTR) perror("[SS] accept"); continue; }
+        struct sockaddr_in ca; nfs_socklen_t len = sizeof ca;
+        int cs = (int)accept(server_sock, (struct sockaddr *)&ca, &len);
+        if (cs < 0) { if (!nfs_sock_eintr()) fprintf(stderr, "[SS] accept: %s\n", nfs_sockerrstr()); continue; }
         ClientArg *a = malloc(sizeof *a);
-        if (!a) { close(cs); continue; }
+        if (!a) { nfs_sockclose(cs); continue; }
         a->sock = cs;
         inet_ntop(AF_INET, &ca.sin_addr, a->ip, sizeof a->ip);
         pthread_t t;
-        if (pthread_create(&t, NULL, handle_client, a) != 0) { free(a); close(cs); }
+        if (pthread_create(&t, NULL, handle_client, a) != 0) { free(a); nfs_sockclose(cs); }
         else pthread_detach(t);
     }
 }

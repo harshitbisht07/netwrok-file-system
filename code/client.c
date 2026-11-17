@@ -11,13 +11,7 @@
  */
 
 #define _GNU_SOURCE
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <unistd.h>
-#include <arpa/inet.h>
-#include <sys/socket.h>
-#include <netinet/in.h>
+#include "nfs_compat.h"
 #include "netproto.h"
 
 static char        nm_ip[INET_ADDRSTRLEN] = "127.0.0.1";
@@ -39,17 +33,17 @@ static int read_line(const char *prompt, char *buf, int bufsz)
 
 static int connect_auth(const char *ip, int port, int timeout_s, const char *what)
 {
-    int s = socket(AF_INET, SOCK_STREAM, 0);
+    int s = (int)socket(AF_INET, SOCK_STREAM, 0);
     if (s < 0) { perror("[-] socket"); return -1; }
     struct sockaddr_in a; memset(&a, 0, sizeof a);
     a.sin_family = AF_INET; a.sin_port = htons(port);
     if (inet_pton(AF_INET, ip, &a.sin_addr) != 1)
-        { fprintf(stderr, "[-] '%s' is not a valid IPv4 address\n", ip); close(s); return -1; }
+        { fprintf(stderr, "[-] '%s' is not a valid IPv4 address\n", ip); nfs_sockclose(s); return -1; }
     nfs_tune(s); nfs_set_timeout(s, 10);
     if (connect(s, (struct sockaddr *)&a, sizeof a) < 0)
-        { fprintf(stderr, "[-] Cannot connect to %s %s:%d: %s\n", what, ip, port, strerror(errno)); close(s); return -1; }
+        { fprintf(stderr, "[-] Cannot connect to %s %s:%d: %s\n", what, ip, port, nfs_sockerrstr()); nfs_sockclose(s); return -1; }
     if (nfs_auth_connect(s, g_secret) != 0)
-        { fprintf(stderr, "[-] Authentication with %s failed (wrong shared secret?)\n", what); close(s); return -1; }
+        { fprintf(stderr, "[-] Authentication with %s failed (wrong shared secret?)\n", what); nfs_sockclose(s); return -1; }
     nfs_set_timeout(s, timeout_s);
     return s;
 }
@@ -79,8 +73,8 @@ static void ss_read(const char *ip, int port, const char *name)
     if (s < 0) return;
     char status[256];
     if (send_str(s, "1") || send_str(s, name) || recv_str(s, status, sizeof status))
-        { printf("[!] Storage server did not answer.\n\n"); close(s); return; }
-    if (strcmp(status, "OK") != 0) { printf("[ERROR] %s\n\n", status); close(s); return; }
+        { printf("[!] Storage server did not answer.\n\n"); nfs_sockclose(s); return; }
+    if (strcmp(status, "OK") != 0) { printf("[ERROR] %s\n\n", status); nfs_sockclose(s); return; }
 
     printf("\n--- File Contents ---\n");
     char *buf = malloc(NFS_CHUNK);
@@ -96,7 +90,7 @@ static void ss_read(const char *ip, int port, const char *name)
     if (last != '\n') putchar('\n');
     printf("--- End of File ---\n\n");
     free(buf);
-    close(s);
+    nfs_sockclose(s);
 }
 
 static void ss_write(const char *ip, int port, const char *name, const char *data)
@@ -110,7 +104,7 @@ static void ss_write(const char *ip, int port, const char *name, const char *dat
     if (!bad) bad = send_frame(s, "", 0);                 /* end of data */
     if (bad || recv_str(s, resp, sizeof resp)) printf("[!] Storage server did not answer.\n\n");
     else printf("[+] %s\n\n", resp);
-    close(s);
+    nfs_sockclose(s);
 }
 
 static void ss_info(const char *ip, int port, const char *name)
@@ -120,7 +114,7 @@ static void ss_info(const char *ip, int port, const char *name)
     char resp[2200];
     if (send_str(s, "3") || send_str(s, name) || recv_str(s, resp, sizeof resp)) printf("[!] Storage server did not answer.\n\n");
     else printf("\n%s\n\n", resp);
-    close(s);
+    nfs_sockclose(s);
 }
 
 /* ------------------------------------------------------------------ */
@@ -228,11 +222,12 @@ static void session(void)
         }
         else printf("[!] Invalid choice. Enter 0-7.\n\n");
     }
-    close(nm);
+    nfs_sockclose(nm);
 }
 
 int main(int argc, char *argv[])
 {
+    nfs_net_init();
     if (argc >= 2) snprintf(nm_ip, sizeof nm_ip, "%s", argv[1]);
     if (argc >= 3) nm_port = atoi(argv[2]);
 

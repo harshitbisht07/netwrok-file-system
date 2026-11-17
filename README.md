@@ -5,17 +5,28 @@ delete and list files that live on one or more storage servers, coordinated by a
 
 ## Build and run
 
-    ./bash.sh                                   # builds: server, naming-server, client
-    export NFS_SECRET='some-long-random-string' # the SAME value on every machine, min 8 chars
+### Windows (native, no WSL)
 
-    ./naming-server                             # 1. Naming Server (ports 5566 for SS, 5568 for clients)
-    ./server 127.0.0.1 5566 5567                # 2. Storage Server (files go in ./storage)
-    ./client 127.0.0.1 5568                     # 3. Client
+    .\build.ps1          # builds naming-server.exe, server.exe, client.exe
+    .\launch_all.ps1     # starts all three on this PC, one window each
 
-Or run `./launch_all.sh` (Linux/WSL) / `launch_all.ps1` (Windows, via WSL) to open all three.
-See `QUICKSTART.md` for running across several PCs.
+### Linux / macOS / WSL
 
-Dependencies: a C compiler and POSIX/Linux libc (no third-party libraries).
+    ./bash.sh
+    export NFS_SECRET='some-long-random-string'   # the SAME value on every machine, min 8 chars
+    ./naming-server 0.0.0.0 5566 5568 --remote-rw
+    ./server 127.0.0.1 5566 5567                  # files go in ./storage
+    ./client 127.0.0.1 5568
+
+See `QUICKSTART.md` for the two-PC LAN setup (primary PC runs everything, the
+second PC runs only the client).
+
+Dependencies: a C compiler. On Windows, MinGW-w64 gcc (MSYS2); everything else is
+Winsock and the Win32 CRT. No third-party libraries on any platform.
+
+Portability: `helper files/nfs_compat.h` holds every Windows/POSIX difference
+(Winsock vs BSD sockets, `realpath`, directory removal, the random source, the
+password prompt), so the three `.c` files stay single-source for both platforms.
 
 ## Components
 
@@ -25,6 +36,15 @@ Dependencies: a C compiler and POSIX/Linux libc (no third-party libraries).
 3. **Storage Server (SS)** - stores the files inside one dedicated directory (`./storage` by default, or the
    4th argument). Its logs (`ss_log.txt`) are kept outside that directory. The NM learns an SS's IP from the
    connection and fetches its file list over the network, so storage servers can run on other machines.
+
+## Access control
+
+- `--remote-rw` on the naming server: clients on **other** machines may read, write,
+  get info, create and list, but delete and copy are refused with `403`. A client on
+  the naming server's own machine always keeps full access (loopback or that machine's
+  own LAN address). `--full-access` turns the restriction off. The naming server
+  enforces this, so patching a client does not get around it.
+- Everyone who knows the shared secret can connect; there are no per-user accounts.
 
 ## Security
 
@@ -37,9 +57,12 @@ Dependencies: a C compiler and POSIX/Linux libc (no third-party libraries).
   network can read it, and an active attacker can tamper with it after the handshake. On an untrusted
   network, run it over a VPN (e.g. WireGuard) or an SSH tunnel. Use a long random secret: a weak one can be
   guessed offline from a captured handshake.
-- Everyone who knows the secret has full access; there are no per-user permissions.
+- Beyond the read/write restriction above there are no per-user permissions.
 
 ## File names
+
+On Windows, names are matched case-insensitively (`A.TXT` and `a.txt` are the same
+file) because the underlying filesystem is; on Linux they stay case-sensitive.
 
 Any normal name works: upper-case, dots, digits, spaces, sub-folders (`reports/Q3.v2.TXT`).
 End a name with `/` to create a directory (parent folders must already exist).
@@ -78,3 +101,4 @@ control characters, names over 1000 characters. Names are case-sensitive.
     103  error deleting (e.g. dir not empty)  109  write too large (16 MB per request)
     104  file already exists                  400  unknown command
     105  error getting file info              503  storage server unavailable
+    403  operation not allowed from this client (see Access control)

@@ -14,19 +14,7 @@
 #ifndef NETPROTO_H
 #define NETPROTO_H
 
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <stdint.h>
-#include <unistd.h>
-#include <errno.h>
-#include <fcntl.h>
-#include <sys/types.h>
-#include <sys/socket.h>
-#include <sys/time.h>
-#include <netinet/in.h>
-#include <netinet/tcp.h>
-#include <arpa/inet.h>
+#include "nfs_compat.h"   /* Winsock / POSIX differences live in here */
 
 #define NFS_MAX_NAME    1000                 /* longest accepted file name   */
 #define NFS_CTRL_MAX    (1u << 20)           /* largest control frame (1 MB) */
@@ -37,13 +25,18 @@
 /* ------------------------------------------------------------------ */
 /* Socket I/O                                                          */
 /* ------------------------------------------------------------------ */
+/* One chunk at a time: Winsock's send()/recv() take an int length, so the
+ * transfer is capped per call and the loop handles the rest. */
+#define NFS_IO_STEP (1 << 20)
+
 static inline int send_all(int fd, const void *buf, size_t len)
 {
     const char *p = (const char *)buf;
     while (len)
     {
-        ssize_t n = send(fd, p, len, MSG_NOSIGNAL);
-        if (n < 0) { if (errno == EINTR) continue; return -1; }
+        int want = len > NFS_IO_STEP ? NFS_IO_STEP : (int)len;
+        int n = (int)send(fd, p, want, MSG_NOSIGNAL);
+        if (n < 0) { if (nfs_sock_eintr()) continue; return -1; }
         if (n == 0) return -1;
         p += n; len -= (size_t)n;
     }
@@ -55,24 +48,42 @@ static inline int recv_all(int fd, void *buf, size_t len)
     char *p = (char *)buf;
     while (len)
     {
-        ssize_t n = recv(fd, p, len, 0);
-        if (n < 0) { if (errno == EINTR) continue; return -1; }
+        int want = len > NFS_IO_STEP ? NFS_IO_STEP : (int)len;
+        int n = (int)recv(fd, p, want, 0);
+        if (n < 0) { if (nfs_sock_eintr()) continue; return -1; }
         if (n == 0) return -1;
         p += n; len -= (size_t)n;
     }
     return 0;
 }
 
+/* Writes to a FILE descriptor (not a socket). */
 static inline int fd_write_all(int fd, const void *buf, size_t len)
 {
     const char *p = (const char *)buf;
     while (len)
     {
-        ssize_t n = write(fd, p, len);
+        unsigned want = len > NFS_IO_STEP ? NFS_IO_STEP : (unsigned)len;
+#ifdef _WIN32
+        int n = _write(fd, p, want);
+#else
+        ssize_t n = write(fd, p, want);
+#endif
         if (n < 0) { if (errno == EINTR) continue; return -1; }
         p += n; len -= (size_t)n;
     }
     return 0;
+}
+
+/* Reads from a FILE descriptor (not a socket). Returns bytes read, 0 at EOF, -1 on error. */
+static inline int fd_read_some(int fd, void *buf, size_t len)
+{
+    unsigned want = len > NFS_IO_STEP ? NFS_IO_STEP : (unsigned)len;
+#ifdef _WIN32
+    return _read(fd, buf, want);
+#else
+    return (int)read(fd, buf, want);
+#endif
 }
 
 /* Frame = uint32 big-endian length, then payload. Zero-length frames are legal. */
@@ -120,15 +131,27 @@ static inline int recv_str(int fd, char *buf, size_t cap)
 static inline void nfs_tune(int fd)
 {
     int one = 1;
-    setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+    setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, (const char *)&one, sizeof(one));
+}
+
+static inline void nfs_reuseaddr(int fd)
+{
+    int one = 1;
+    setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, (const char *)&one, sizeof(one));
 }
 
 /* secs == 0 disables the timeout */
 static inline void nfs_set_timeout(int fd, int secs)
 {
+#ifdef _WIN32
+    DWORD ms = (DWORD)secs * 1000u;                 /* Winsock wants milliseconds */
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, (const char *)&ms, sizeof(ms));
+    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, (const char *)&ms, sizeof(ms));
+#else
     struct timeval tv; tv.tv_sec = secs; tv.tv_usec = 0;
-    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, (const char *)&tv, sizeof(tv));
+    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, (const char *)&tv, sizeof(tv));
+#endif
 }
 
 /* ------------------------------------------------------------------ */
@@ -235,20 +258,8 @@ static void nfs_hmac_sha256(const uint8_t *key, size_t klen,
 /* Fresh nonces per connection stop replay; the role tags stop a peer  */
 /* from reflecting our own answer back at us.                          */
 /* ------------------------------------------------------------------ */
-static inline int nfs_random(void *buf, size_t n)
-{
-    int fd = open("/dev/urandom", O_RDONLY);
-    if (fd < 0) return -1;
-    size_t got = 0; char *p = (char *)buf;
-    while (got < n)
-    {
-        ssize_t r = read(fd, p + got, n - got);
-        if (r <= 0) { if (r < 0 && errno == EINTR) continue; close(fd); return -1; }
-        got += (size_t)r;
-    }
-    close(fd);
-    return 0;
-}
+/* nfs_random() lives in nfs_compat.h: /dev/urandom on POSIX,
+ * BCryptGenRandom() on Windows. */
 
 static inline int nfs_ct_equal(const uint8_t *a, const uint8_t *b, size_t n)
 {
@@ -287,7 +298,7 @@ static char nfs_secret_buf[256];
 static inline const char *nfs_load_secret(int interactive)
 {
     const char *s = getenv("NFS_SECRET");
-    if ((!s || !*s) && interactive) s = getpass("Shared secret: ");
+    if ((!s || !*s) && interactive) s = nfs_getpass("Shared secret: ");
     if (!s || !*s)
     {
         fprintf(stderr, "[!] No shared secret. Set NFS_SECRET (at least %d characters).\n", NFS_MIN_SECRET);

@@ -8,17 +8,8 @@
 #ifndef CONVENIENCE_H
 #define CONVENIENCE_H
 
-#include <stdio.h>
-#include <stdlib.h>
+#include "nfs_compat.h"
 #include <stdbool.h>
-#include <string.h>
-#include <unistd.h>
-#include <arpa/inet.h>
-#include <sys/socket.h>
-#include <netinet/in.h>
-#include <netdb.h>
-#include <errno.h>
-#include <semaphore.h>
 #include <pthread.h>
 
 /* Default ports — all overridable via CLI args */
